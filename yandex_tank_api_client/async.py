@@ -365,58 +365,77 @@ class SessionWrapper(object):
         """
         poll_failure_count = 0
         status = None
-        while poll_failure_count < poll_failure_limit:
+
+
+    def _refresh_status(self):
+        for n_attempt in xrange(self.poll_failure_limit):
             try:
-                status = self.session.get_status()
+                self.status = self.session.get_status()
             except urllib2.URLError as err:
+                if n_attempt == (self.poll_failure_limit-1):
+                    raise tankapi.RetryLater()
                 self.log.warning(
                     "Failed to obtain session status: %s", str(err))
-                poll_failure_count += 1
-            else:
-                poll_failure_count = 0
-                if self.status_callback:
-                    self.status_callback(status)
-                if 'failures' in status and \
-                        any(flr['stage'] == 'lock'
-                            for flr in status['failures']):
-                    self.log.info("%s is locked", self.session.tank)
-                    raise tankapi.RetryLater()
 
-                if status['status'] == 'failed':
-                    self.finished = True
-                    self.log.warning(
-                        "Session %s on %s failed:\n%s",
-                        self.session.s_id,
-                        self.session.tank,
-                        '\n'.join('%s: %s' % (
-                            flr.get('stage', '__unknown stage__'),
-                            flr.get('reason', '__reason not specified__')
-                            )
-                            for flr in status.get('failures', [])
-                        )
+    def _set_finished(self, success, retry):
+        self.finished = True
+        self.success = success
+        self.retry = retry and not success
+
+    def poll(self):
+        """
+        :returns bool: True if caller should just do next poll
+            False if it should analyze what we got
+        """
+        if self.finished:
+            self.log.warning("Will not poll finished session (bug in client?)")
+            return True
+
+        try:
+            self._refresh_status()
+        except tankapi.RetryLater: 
+            if self.status is None or self.status['stage'] in ('init','lock'):
+                self._set_finished(False, True)
+                return False
+            raise
+
+        if self.status_callback:
+            self.status_callback(status)
+        if 'failures' in self.status and \
+                any(flr['stage'] == 'lock' for flr in self.status['failures']):
+            self.log.info("%s is locked", self.session.tank)
+            self._set_finished(False, True)
+            return False
+
+        if status['status'] == 'failed':
+            self.log.warning(
+                "Session %s on %s failed:\n%s",
+                self.session.s_id,
+                self.session.tank,
+                '\n'.join('%s: %s' % (
+                    flr.get('stage', '__unknown stage__'),
+                    flr.get('reason', '__reason not specified__')
                     )
-                    raise TestFailed(status)
-
-                if status['status'] == 'success':
-                    self.finished = True
-                    self.log.info("Session %s finished successfully",
-                                  self.session.s_id)
-                    raise Return(status)
-
-                last_stage = status.get('current_stage', 'unknown')
-                completed = status.get('stage_completed', False)
-                self.log.info(
-                    "Session %s: %s, %scomplete",
-                    self.session.s_id,
-                    last_stage,
-                    '' if completed else 'in'
+                    for flr in status.get('failures', [])
                 )
-                if target_stage == last_stage and completed:
-                    raise Return(status)
-            yield From(sleep(poll_interval))
-        self.log.warning("Exceeded poll failure limit")
-        if status is None or status['stage'] in ('init','lock'):
-            # We have not locked the tank yet
-            raise tankapi.RetryLater()
-        # We have locked the tank and it died quietly
-        raise RuntimeError("Tank poll failure limit exceeded")
+            )
+            self._set_finished(False, False)
+            return False
+
+        if status['status'] == 'success':
+            self.log.info("Session %s finished successfully",
+                          self.session.s_id)
+            self._set_finished(True, False)
+            return False
+
+        last_stage = status.get('current_stage', 'unknown')
+        completed = status.get('stage_completed', False)
+        self.log.info(
+            "Session %s: %s, %scomplete",
+            self.session.s_id,
+            last_stage,
+            '' if completed else 'in'
+        )
+        return not completed or (self.target_stage == last_stage)
+
+
