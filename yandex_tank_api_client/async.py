@@ -278,6 +278,7 @@ class SessionWrapper(object):
                 self.session.stop()
             except tankapi.NothingDone:
                 self.log.info("Session %s is not running", self.session.s_id)
+                break
             except urllib2.URLError:
                 self.log.exception(
                     "Failed to communicate with %s to stop session",
